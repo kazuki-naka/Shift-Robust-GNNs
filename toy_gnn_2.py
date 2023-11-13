@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dgl.nn.pytorch.conv import GraphConv
-from layers import GATConv
 import utils
 import numpy as np
 import pickle
@@ -106,57 +105,7 @@ class ReverseLayerF(Function):
 
         return output, None
 
-# class ToyGNN(nn.Module):
-#     def __init__(self,
-#                  g,
-#                  in_feats,
-#                  n_hidden,
-#                  n_classes,
-#                  n_layers,
-#                  activation,
-#                  dropout):
-#         super(ToyGNN, self).__init__()
-#         self.layers = nn.ModuleList()
-#         self.g = g
-#         #print(in_feats, n_hidden, n_classes)
-#         # input layer
-#         self.layers.append(GraphConv(in_feats, n_hidden, activation=None))
-
-#         # hidden layers
-#         self.activation = activation
-#         for i in range(n_layers-1):
-#             self.layers.append(GraphConv(n_hidden, n_hidden, activation=None))
-#         # output layer hidden units -> n_classes
-#         self.layers.append(GraphConv(n_hidden, n_classes, activation=None)) # activation None
-#         self.fcs = nn.ModuleList([nn.Linear(n_hidden, n_hidden, bias=True), nn.Linear(n_hidden, 2, bias=True)])
-#         self.disc = GraphConv(n_hidden, 2, activation=None)
-#         self.dropout = nn.Dropout(p=dropout)
-
-#     def forward(self, features):
-#         h = features
-#         for idx, layer in enumerate(self.layers[:-1]):
-#             h = layer(self.g, h)
-#             h = self.activation(h)
-#             h = self.dropout(h)
-#         self.h = h
-
-#         return self.layers[-1](self.g, h)
-    
-#     def dann_output(self, idx_train, iid_train, alpha=1):
-#         reverse_feature = ReverseLayerF.apply(self.h, alpha)
-#         dann_loss = xent(self.disc(self.g, reverse_feature)[idx_train,:], torch.ones_like(labels[idx_train])).mean() + xent(self.disc(self.g, reverse_feature)[iid_train,:], torch.zeros_like(labels[iid_train])).mean()
-#         return dann_loss
-    
-#     def shift_robust_output(self, idx_train, iid_train, alpha = 1):
-#         return alpha * cmd(self.h[idx_train, :], self.h[iid_train, :])
-
-#     def output(self, features):
-#         h = features
-#         for layer in self.layers[:-1]:
-#             h = layer(self.g, h)
-#         return h
-
-class GAT(nn.Module):
+class ToyGNN(nn.Module):
     def __init__(self,
                  g,
                  in_feats,
@@ -164,20 +113,22 @@ class GAT(nn.Module):
                  n_classes,
                  n_layers,
                  activation,
-                 dropout, 
-                 num_heads=8):
-        super(GAT, self).__init__()
+                 dropout):
+        super(ToyGNN, self).__init__()
         self.layers = nn.ModuleList()
         self.g = g
+        #print(in_feats, n_hidden, n_classes)
         # input layer
-        self.layers.append(GATConv(in_feats, n_hidden, num_heads=num_heads, feat_drop=dropout, activation=activation))
+        self.layers.append(GraphConv(in_feats, n_hidden, activation=None))
+
         # hidden layers
-        for i in range(n_layers - 1):
-            self.layers.append(GATConv(n_hidden*num_heads, n_hidden, num_heads=num_heads, feat_drop=dropout, activation=activation))
-        # output layer
-        self.layers.append(GATConv(n_hidden*num_heads, n_classes, num_heads=1, feat_drop=dropout, activation=None))
+        self.activation = activation
+        for i in range(n_layers-1):
+            self.layers.append(GraphConv(n_hidden, n_hidden, activation=None))
+        # output layer hidden units -> n_classes
+        self.layers.append(GraphConv(n_hidden, n_classes, activation=None)) # activation None
         self.fcs = nn.ModuleList([nn.Linear(n_hidden, n_hidden, bias=True), nn.Linear(n_hidden, 2, bias=True)])
-        self.disc = GATConv(n_hidden, 2, activation=None)
+        self.disc = GraphConv(n_hidden, 2, activation=None)
         self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, features):
@@ -215,12 +166,10 @@ if __name__ == '__main__':
     g = dgl.from_networkx(nx_g).to(device)
     labels = torch.LongTensor([np.where(r==1)[0][0] if r.sum() > 0 else -1 for r in one_hot_labels]).to(device)
     features = torch.FloatTensor(utils.preprocess_features(features)).to(device)
-    feat = F.normalize(features, p=1,dim=1)
-    features = feat
     xent = nn.CrossEntropyLoss(reduction='none')
     
 
-    model = GAT(g,features.shape[1],32,labels.max().item() + 1,1,F.tanh,0.2)
+    model = ToyGNN(g,features.shape[1],32,labels.max().item() + 1,1,F.tanh,0.2)
     optimiser = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=0.0005)
     model.cuda()
     # an example of biased training data

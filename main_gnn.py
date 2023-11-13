@@ -3,12 +3,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.autograd import Function
 from collections import defaultdict, Counter
 
 from IPython import embed
 import dgl
 #from ogb.nodeproppred import Evaluator
-from dgl_models import Net, GraphSAGE, PPRPowerIteration, SGC, GAT
+from dgl_models import GAT
+from layers import GATConv
+
+from dgl.nn.pytorch.conv import GraphConv
 
 from sklearn import preprocessing
 import networkx as nx
@@ -93,16 +97,15 @@ def pairwise_distances(x, y=None):
         y_norm = x_norm.view(1, -1)
     
     dist = x_norm + y_norm - 2.0 * torch.mm(x, y_t)
-    #dist = torch.mm(x, y_t)
-    #Ensure diagonal is zero if x=y
-    #if y is None:
-    #     dist = dist - torch.diag(dist.diag)
     return torch.clamp(dist, 0.0, np.inf)
+
+
 def naiveIW(X, Xtest, _A=None, _sigma=1e1):
     prob =  torch.exp(- _sigma * torch.norm(X - Xtest.mean(dim=0), dim=1, p=2) ** 2 )
     for i in range(_A.shape[0]):
         prob[_A[i,:]==1] = F.normalize(prob[_A[0,:]==1], dim=0, p=1) * _A[i,:].sum()
     return prob
+
 
 def MMD(X,Xtest):
     H = torch.exp(- 1e0 * pairwise_distances(X)) + torch.exp(- 1e-1 * pairwise_distances(X)) + torch.exp(- 1e-3 * pairwise_distances(X))
@@ -111,85 +114,112 @@ def MMD(X,Xtest):
     MMD_dist = H.mean() - 2 * f.mean() + z.mean()
     return MMD_dist
 
-def KMM(X,Xtest,_A=None, _sigma=1e1):
-    #embed()
-    if False:
-        H = X.matmul(X.T)
-        f = X.matmul(Xtest.T)
-        z = Xtest.matmul(Xtest.T)
-    #
-    #H = torch.exp(- _sigma * pairwise_distances(X))
-    #f = torch.exp(- _sigma * pairwise_distances(X, Xtest))
-    #z = torch.exp(- _sigma * pairwise_distances(Xtest, Xtest))
-    else:
-        H = torch.exp(- 1e0 * pairwise_distances(X)) + torch.exp(- 1e-1 * pairwise_distances(X)) + torch.exp(- 1e-3 * pairwise_distances(X))
-        f = torch.exp(- 1e0 * pairwise_distances(X, Xtest)) + torch.exp(- 1e-1 * pairwise_distances(X, Xtest)) + torch.exp(- 1e-3 * pairwise_distances(X, Xtest))
-        z = torch.exp(- 1e0 * pairwise_distances(Xtest, Xtest)) + torch.exp(- 1e-1 * pairwise_distances(Xtest, Xtest)) + torch.exp(- 1e-3 * pairwise_distances(Xtest, Xtest))
-        H /= 3
-        f /= 3
-    #
-    #embed()
+def KMM(X,Xtest,_A=None, _sigma=1e1,beta=0.2):
+
+    H = torch.exp(- 1e0 * pairwise_distances(X)) + torch.exp(- 1e-1 * pairwise_distances(X)) + torch.exp(- 1e-3 * pairwise_distances(X))
+    f = torch.exp(- 1e0 * pairwise_distances(X, Xtest)) + torch.exp(- 1e-1 * pairwise_distances(X, Xtest)) + torch.exp(- 1e-3 * pairwise_distances(X, Xtest))
+    z = torch.exp(- 1e0 * pairwise_distances(Xtest, Xtest)) + torch.exp(- 1e-1 * pairwise_distances(Xtest, Xtest)) + torch.exp(- 1e-3 * pairwise_distances(Xtest, Xtest))
+    H /= 3
+    f /= 3
     MMD_dist = H.mean() - 2 * f.mean() + z.mean()
     
     nsamples = X.shape[0]
     f = - X.shape[0] / Xtest.shape[0] * f.matmul(torch.ones((Xtest.shape[0],1)))
-    #eps = (math.sqrt(nsamples)-1)/math.sqrt(nsamples)
-    eps = 10
-    #A = np.ones((2,nsamples))
-    #A[1,:] = -1
-    #b = np.array([[nsamples * (eps+1)], [nsamples * (eps-1)]])
-    #lb = np.zeros((nsamples,1))
-    #ub = np.ones((nsamples,1))*1000
-    #Aeq, beq = [], []
-    #embed()
-    #qp_C = -A.T
-    #qp_b = -b
-    #meq = 0
     G = - np.eye(nsamples)
-    #h = np.zeros((nsamples,1))
-    #if _A is None:
-    #    return None, MMD_dist
-    #A = 
-    b = np.ones([_A.shape[0],1]) * 20
-    h = - 0.2 * np.ones((nsamples,1))
+    _A = _A[~np.all(_A==0, axis=1)]
+    b = _A.sum(1)
+    h = - beta * np.ones((nsamples,1))
     
     from cvxopt import matrix, solvers
-    #return quadprog.solve_qp(H.numpy(), f.numpy(), qp_C, qp_b, meq)
-    try:
-        solvers.options['show_progress'] = False
-        sol=solvers.qp(matrix(H.numpy().astype(np.double)), matrix(f.numpy().astype(np.double)), matrix(G), matrix(h), matrix(_A), matrix(b))
-    except:
-        embed()
-    #embed()
-    #np.matmul(np.matmul(np.array(sol['x']).T, H.numpy()), sol['x']) + np.matmul(f.numpy().T, np.array(sol['x']))
+    solvers.options['show_progress'] = False
+    sol=solvers.qp(matrix(H.numpy().astype(np.double)), matrix(f.numpy().astype(np.double)), matrix(G), matrix(h), matrix(_A), matrix(b))
     return np.array(sol['x']), MMD_dist.item()
-    #return solve_qp(H.numpy(), f.numpy(), A, b, None, None, lb, ub)
-    
 
+
+class ReverseLayerF(Function):
+
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        output = grad_output.neg() * ctx.alpha
+
+        return output, None
+
+class GAT(nn.Module):
+    def __init__(self,
+                 g,
+                 in_feats,
+                 n_hidden,
+                 n_classes,
+                 n_layers,
+                 activation,
+                 dropout,
+                 num_heads=8):
+        super(GAT, self).__init__()
+        self.layers = nn.ModuleList()
+        self.g = g
+
+        # input layer
+        self.layers.append(GATConv(in_feats, n_hidden, num_heads=num_heads, feat_drop=dropout, activation=activation))
+        # hidden layers
+        for i in range(n_layers - 1):
+            self.layers.append(GATConv(n_hidden*num_heads, n_hidden, num_heads=num_heads, feat_drop=dropout, activation=activation))
+        # output layer
+        self.layers.append(GATConv(n_hidden*num_heads, n_classes, num_heads=1, feat_drop=dropout, activation=None)) # activation None
+        self.fcs = nn.ModuleList([nn.Linear(n_hidden, n_hidden, bias=True), nn.Linear(n_hidden, 2, bias=True)])
+        self.disc = GraphConv(n_hidden, 2, activation=None)
+        self.dropout = nn.Dropout(p=dropout)
+
+        #embed()
+    def forward(self, features, bns=False):
+        h = features
+        for idx in range(len(self.layers)-1):
+            h = self.layers[idx](self.g, h).flatten(1)
+        self.h = h
+        return self.layers[-1](self.g, h).mean(1)
+
+    def dann_output(self, idx_train, iid_train, alpha=1):
+        reverse_feature = ReverseLayerF.apply(self.h, alpha)
+        dann_loss = xent(self.disc(self.g, reverse_feature)[idx_train,:], torch.ones_like(labels[idx_train])).mean() + xent(self.disc(self.g, reverse_feature)[iid_train,:], torch.zeros_like(labels[iid_train])).mean()
+        return dann_loss
+    
+    def shift_robust_output(self, idx_train, iid_train, alpha = 1):
+        return alpha * cmd(self.h[idx_train, :], self.h[iid_train, :])
+
+    def output(self, features):
+        h = features
+        for layer in self.layers[:-1]:
+            h = layer(self.g, h)
+        return h
 
 # for connected edges
-def calc_feat_smooth(adj, features):
-    A = sp.diags(adj.sum(1).flatten().tolist()[0])
-    D = (A - adj)
-    #(D * features) ** 2
-    return (D * features)
-    smooth_value = ((D * features) ** 2).sum() / (adj.sum() / 2 * features.shape[1])
+# def calc_feat_smooth(adj, features):
+#     A = sp.diags(adj.sum(1).flatten().tolist()[0])
+#     D = (A - adj)
+#     #(D * features) ** 2
+#     return (D * features)
+#     smooth_value = ((D * features) ** 2).sum() / (adj.sum() / 2 * features.shape[1])
     
-    adj_rev = 1 - adj.todense()
-    np.fill_diagonal(adj_rev, 0)
+#     adj_rev = 1 - adj.todense()
+#     np.fill_diagonal(adj_rev, 0)
 
-    A = sp.diags(adj_rev.sum(1).flatten().tolist()[0])
-    D_rev = (A - adj_rev)
-    smooth_rev_value = np.power(np.matmul(D_rev, features), 2).sum() / (adj_rev.sum() / 2 * features.shape[1])
-    # D = torch.Tensor(D)
+#     A = sp.diags(adj_rev.sum(1).flatten().tolist()[0])
+#     D_rev = (A - adj_rev)
+#     smooth_rev_value = np.power(np.matmul(D_rev, features), 2).sum() / (adj_rev.sum() / 2 * features.shape[1])
+#     # D = torch.Tensor(D)
     
-    return smooth_value, smooth_rev_value
-    #return 
+#     return smooth_value, smooth_rev_value
+#     #return 
 
-def calc_emb_smooth(adj, features):
-    A = sp.diags(adj.sum(1).flatten().tolist()[0])
-    D = (A - adj)
-    return ((D * features) ** 2).sum() / (adj.sum() / 2 * features.shape[1])
+# def calc_emb_smooth(adj, features):
+#     A = sp.diags(adj.sum(1).flatten().tolist()[0])
+#     D = (A - adj)
+#     return ((D * features) ** 2).sum() / (adj.sum() / 2 * features.shape[1])
 
 def snowball(g, max_train, ori_idx_train, labels):
     train_seeds = set()
@@ -287,7 +317,7 @@ def main(args, new_classes):
         #feat = min_max_scaler.fit_transform(features)
         feat = F.normalize(features, p=1,dim=1)
         #smooth_val, smooth_rev_val = calc_feat_smooth(adj, feat)
-        feat_smooth_matrix = calc_feat_smooth(adj, feat)
+        # feat_smooth_matrix = calc_feat_smooth(adj, feat)
         #print(smooth_val, smooth_rev_val.item())
         features = feat
         
@@ -314,7 +344,6 @@ def main(args, new_classes):
 
     #
     xent = nn.CrossEntropyLoss(reduction='none')
-    #xent = nn.CrossEntropyLoss()
 
     cnt_wait = 0
     best = 1e9
@@ -441,48 +470,12 @@ def main(args, new_classes):
         reg_lbls = torch.cat([torch.ones(len(idx_train), dtype=torch.long), torch.zeros(len(idx_train), dtype=torch.long)]).cuda()
         # print(Counter(train_lbls.cpu().detach().numpy().tolist()))
         # enlarge the validation pool for DBLP 
-        if args.gnn_arch == 'graphsage':
-            model = GraphSAGE(g,
-                    ft_size,
-                    args.n_hidden,
-                    nb_classes,
-                    args.n_layers,
-                    #F.relu,
-                    F.relu,
-                    args.dropout,
-                    args.aggregator_type
-                    )
-        elif args.gnn_arch == 'gat':
+        if args.gnn_arch == 'gat':
             model = GAT(g,
                     ft_size,
                     args.n_hidden,
                     nb_classes,
                     args.n_layers,
-                    F.tanh,
-                    args.dropout,
-                    args.aggregator_type
-                    )
-        elif args.gnn_arch == 'ppnp':
-            model = PPRPowerIteration(ft_size, args.n_hidden, nb_classes, adj, alpha=0.1, niter=10, drop_prob=args.dropout)
-        elif args.gnn_arch == 'sgc':
-            model = SGC(g,
-                    ft_size,
-                    args.n_hidden,
-                    nb_classes,
-                    args.n_layers,
-                    F.tanh,
-                    args.dropout,
-                    args.aggregator_type
-                    )
-        else:
-            #model = GCN(ft_size, args.n_hidden, nb_classes, args.n_layers, F.relu, args.dropout, False)
-            
-            model = Net(g,
-                    ft_size,
-                    args.n_hidden,
-                    nb_classes,
-                    args.n_layers,
-                    #F.relu,
                     F.tanh,
                     args.dropout,
                     args.aggregator_type
@@ -671,7 +664,7 @@ if __name__ == '__main__':
                         help="gpu")
     parser.add_argument("--lr", type=float, default=1e-2,
                         help="learning rate")
-    parser.add_argument("--gnn-arch", type=str, default='gcn',
+    parser.add_argument("--gnn-arch", type=str, default='gat',
                         help="gnn arch of gcn/gat/graphsage")
     parser.add_argument("--SR", type=bool, default=False,
                         help="use shift-robust or not")
