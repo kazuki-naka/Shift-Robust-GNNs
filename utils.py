@@ -26,9 +26,6 @@ def pairwise_distances(x, y=None):
         y_norm = x_norm.view(1, -1)
     
     dist = x_norm + y_norm - 2.0 * torch.mm(x, y_t)
-    # Ensure diagonal is zero if x=y
-    # if y is None:
-    #     dist = dist - torch.diag(dist.diag)
     return torch.clamp(dist, 0.0, np.inf)
 
 def generateUnseen(num_class, num_unseen):
